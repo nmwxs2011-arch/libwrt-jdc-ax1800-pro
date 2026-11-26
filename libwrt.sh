@@ -10,7 +10,7 @@ set -e
 #   1) dnsmasq DNS 劫持端口补丁（上游仓库原有功能，保留）
 #   2) PassWall2 官方源
 #   3) 首次启动配置 99-custom（打印 / 扫描 / 定时 / 服务自启）
-#   4) 重新拉取 feeds，使新加的源在 defconfig 时可见
+#   4) 只更新新增的 PassWall2 源（不 clean、不全量 update，保护 nss feed）
 # ============================================================
 
 # ---------- 1) dnsmasq DNSMASQ HIJACK 端口补丁 ----------
@@ -90,7 +90,13 @@ exit 0
 CUSTOM
 chmod +x files/etc/uci-defaults/99-custom
 
-# ---------- 4) 重新拉取 feeds，让新加的 PassWall2 源在 defconfig 时可见 ----------
-./scripts/feeds clean
-./scripts/feeds update -a
-./scripts/feeds install -a
+# ---------- 4) 只更新新增的 PassWall2 源，让其在 defconfig 时可见 ----------
+# 【关键修复】绝不要执行 `./scripts/feeds clean` 或 `./scripts/feeds update -a`：
+# 工作流在本脚本之前已装好全部 feed（含 nss_packages，提供 NSS 固件 choice）。
+# clean/update -a 会清掉或重建这些 feed，导致 nss-firmware 的选项在 defconfig 时
+# 不可用，CONFIG_NSS_FIRMWARE_VERSION_12_1 变成 <unset>，严格校验随即失败。
+# 这里只针对新加的两个源做 update，再 install 到 package/feeds 下即可。
+./scripts/feeds update passwall_packages
+./scripts/feeds update passwall2
+./scripts/feeds install -p passwall_packages -a
+./scripts/feeds install -p passwall2 -a
