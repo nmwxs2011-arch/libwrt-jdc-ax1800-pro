@@ -62,7 +62,10 @@ cat > files/etc/uci-defaults/99-custom <<'CUSTOM'
 # 这是新机避坑关键：LuCI 页面写 usb_printer，守护进程读 p910nd，
 # 直接生成正确配置可绕过“页面勾了启用但 9100 不监听”的问题。
 mkdir -p /etc/config
-if [ ! -s /etc/config/p910nd ]; then
+# 【v5.1 修复】固件已自带非空 /etc/config/p910nd（enabled=0），原来的
+# `[ ! -s ... ]` 判断因此永远不成立、跳过写入，导致 9100 不监听。
+# 改为：无论文件是否已存在，都用 uci 强制把关键项写成启用值。
+if ! uci show p910nd >/dev/null 2>&1; then
   cat > /etc/config/p910nd <<'EOF_P910'
 config p910nd
     option device '/dev/usb/lp0'
@@ -71,6 +74,12 @@ config p910nd
     option bidirectional '1'
 EOF_P910
 fi
+# 强制覆盖关键项（即使厂商/固件预置了 enabled=0 也会被纠正）
+uci set p910nd.@p910nd[0].device='/dev/usb/lp0' 2>/dev/null
+uci set p910nd.@p910nd[0].port='0' 2>/dev/null
+uci set p910nd.@p910nd[0].enabled='1' 2>/dev/null
+uci set p910nd.@p910nd[0].bidirectional='1' 2>/dev/null
+uci commit p910nd 2>/dev/null
 /etc/init.d/p910nd enable 2>/dev/null
 /etc/init.d/p910nd restart 2>/dev/null
 
@@ -107,6 +116,12 @@ cat > /etc/crontabs/root <<'EOF_CRON'
 EOF_CRON
 /etc/init.d/cron enable 2>/dev/null
 /etc/init.d/cron restart 2>/dev/null
+
+# --- 界面语言：固定为简体中文（v5.2）---
+# 固件已内置 luci-i18n-base-zh-cn 等中文包；这里把默认语言从 auto 改成 zh-cn，
+# 无论浏览器语言是什么都显示中文（编译进固件，无需浏览器 auto 匹配）。
+uci set luci.main.lang='zh-cn' 2>/dev/null
+uci commit luci 2>/dev/null
 
 exit 0
 CUSTOM
