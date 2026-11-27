@@ -9,8 +9,9 @@ set -e
 # 包含：
 #   1) dnsmasq DNS 劫持端口补丁（上游仓库原有功能，保留）
 #   2) PassWall2 官方源
-#   3) 首次启动配置 99-custom（打印 / 扫描 / 定时 / 服务自启）
+#   3) 首次启动配置 99-custom（管理地址 / 打印 / 扫描 / 定时 / 服务自启）
 #   4) 只更新新增的 PassWall2 源（不 clean、不全量 update，保护 nss feed）
+#   5) 默认管理地址改为 192.168.123.1（config_generate + uci-defaults 双保险）
 # ============================================================
 
 # ---------- 1) dnsmasq DNSMASQ HIJACK 端口补丁 ----------
@@ -55,8 +56,16 @@ fi
 mkdir -p files/etc/uci-defaults
 cat > files/etc/uci-defaults/99-custom <<'CUSTOM'
 #!/bin/sh
-# 首次启动自动配置：打印 / 扫描 / 定时重启 / 服务自启
+# 首次启动自动配置：管理地址 / 打印 / 扫描 / 定时重启 / 服务自启
 # 只在首次启动（或升级后首次）执行，之后可自由在 LuCI 修改。
+
+# --- 管理地址：固定为 192.168.123.1（官方 image config 已改，这里再保一道）---
+# 即使刷机时保留了旧配置，首启也会把 LAN 口改到新地址；电脑设 192.168.123.x/24 即可进。
+# 新版 config_generate 用 list ipaddr='IP/前缀'，所以先删旧值再 add_list，避免 option/list 混用。
+uci -q delete network.lan.ipaddr 2>/dev/null
+uci add_list network.lan.ipaddr='192.168.123.1/24' 2>/dev/null
+uci set network.lan.netmask='255.255.255.0' 2>/dev/null
+uci commit network 2>/dev/null
 
 # --- 打印：p910nd 守护进程实际读取 /etc/config/p910nd ---
 # 这是新机避坑关键：LuCI 页面写 usb_printer，守护进程读 p910nd，
@@ -99,8 +108,8 @@ service sane-port
         disable     = no
 }
 EOF_XINETD
-# 允许本网段访问扫描（默认管理地址 192.168.1.1；若改成 192.168.2.1 请同步改）
-grep -q '192.168.1.0/24' /etc/sane.d/saned.conf 2>/dev/null || echo '192.168.1.0/24' >> /etc/sane.d/saned.conf
+# 允许本网段访问扫描（管理地址已改为 192.168.123.1，网段同步为 192.168.123.0/24）
+grep -q '192.168.123.0/24' /etc/sane.d/saned.conf 2>/dev/null || echo '192.168.123.0/24' >> /etc/sane.d/saned.conf
 # 确保 epson2 后端被 dll.conf 加载（L850 走 epson2；每个后端包自带 dll.d 片段，
 # 这里再补一道保险，避免 @noauto 导致后端未启用）。
 mkdir -p /etc/sane.d/dll.d
@@ -137,6 +146,24 @@ chmod +x files/etc/uci-defaults/99-custom
 ./scripts/feeds update passwall2
 ./scripts/feeds install -p passwall_packages -a
 ./scripts/feeds install -p passwall2 -a
+
+# 【关键修复 v5.4 — 本次根因】清掉 workflow 早期 defconfig 留下的 tmp 扫描缓存并重建。
+# 根因：workflow 在 Generate Variables 步骤（feeds.conf 还没有 passwall 源时）跑过
+#   `make defconfig`，生成了 tmp/.config-package.in、tmp/.packageinfo、tmp/info/*。
+#   随后本脚本才 feeds install 新源。但后续 `make defconfig` 的 prepare-tmpinfo 阶段
+#   依赖时间戳判断（tmp/.config-package.in -nt tmp/.packageinfo 时跳过重建），于是
+#   passwall_packages / passwall2 的包符号从未进入 Kconfig。表现为：FEED 标记=y、
+#   软链存在、seed 里 =y，但 build.config 里包符号根本不存在 → defconfig 丢弃。
+# 处理：删掉这些缓存文件强制 make defconfig 重新扫描全部 package（含新装的两个源）。
+#   注意只删 tmp 下的扫描缓存，不动 feeds/、package/feeds/，因此不会影响 nss feed。
+echo ">>> v5.4: clearing stale tmp scan cache so new feeds are visible to defconfig"
+rm -f tmp/.config-package.in tmp/.packageinfo tmp/.packagedeps \
+      tmp/.packageauxvars tmp/.packageusergroup tmp/.config-feeds.in tmp/.build
+rm -rf tmp/info
+# 立即重建，让后面的自检能在新鲜的 tmp/.config-package.in 上判断
+make prepare-tmpinfo >/dev/null 2>&1 || {
+  echo ">>> WARNING: prepare-tmpinfo failed; will retry via defconfig later" >&2
+}
 
 # 【关键修复 v5】显式把 .config 里的 FEED 标记置 y。
 # 根因：workflow 在 clone 后立即跑过一次 make defconfig（Generate Variables 步骤），
@@ -207,3 +234,64 @@ for dep in coreutils coreutils-base64 coreutils-nohup coreutils-timeout ip-full 
   }
 done
 echo ">>> OK: all 7 PassWall2 deps enabled in .config"
+
+# 【自检 v5.4 — 决定性检查】前面所有自检都是间接条件（软链/FEED/依赖），
+# 上一版这些全 OK，界面包却仍被 defconfig 丢弃。这里直接跑一次 defconfig，
+# 然后检查最终 .config 里 luci-app-passwall2 到底是不是 =y。
+# 这样任何"包被丢弃"的问题都会在编译开始前几分钟就 FATAL，不再空等 1.5 小时。
+echo ">>> v5.4: running make defconfig to verify final package selection..."
+make defconfig >/tmp/v54_defconfig.log 2>&1 || {
+  echo ">>> FATAL: make defconfig failed (v5.4 decisive check)." >&2
+  tail -40 /tmp/v54_defconfig.log >&2
+  exit 1
+}
+if grep -q '^CONFIG_PACKAGE_luci-app-passwall2=y' .config 2>/dev/null; then
+  echo ">>> OK: luci-app-passwall2=y present in final .config (v5.4 decisive check)"
+else
+  echo ">>> FATAL: luci-app-passwall2 is NOT selected in final .config after defconfig." >&2
+  echo ">>> DIAG: grep config-package.in:" >&2
+  grep -n 'luci-app-passwall2' tmp/.config-package.in 2>/dev/null | head -5 >&2 || true
+  echo ">>> DIAG: .config passwall lines:" >&2
+  grep -n 'passwall' .config 2>/dev/null | head -20 >&2 || true
+  echo ">>> DIAG: feed symlink:" >&2
+  ls -ld package/feeds/passwall2/luci-app-passwall2 2>/dev/null >&2 || true
+  exit 1
+fi
+# 扫描缓存重建后，passwall_packages 独有包（xray-core 等）也应可见；仅提示不致命
+if grep -q '^config PACKAGE_xray-core$' tmp/.config-package.in 2>/dev/null; then
+  echo ">>> OK: passwall_packages feed packages visible in Kconfig (xray-core found)"
+else
+  echo ">>> WARNING: passwall_packages packages still not in Kconfig; core set may be limited" >&2
+fi
+
+# ---------- 5) 默认管理地址改为 192.168.123.1 ----------
+# 主路径：seed 已开 CONFIG_TARGET_DEFAULT_LAN_IP_FROM_PREINIT=y，
+# 并覆盖 CONFIG_TARGET_PREINIT_IP="192.168.123.1"；base-files 会生成
+# /etc/board.d/99-lan-ip，把该地址写进 board.json，config_generate 据此生成网络配置。
+# 这里再改 config_generate 里的兜底字面量作为第二道保险。
+# 99-custom 里的 uci 写入是第三道保险（保留配置升级时也能纠正）。
+CFG_GEN="package/base-files/files/bin/config_generate"
+if [ -f "$CFG_GEN" ]; then
+  before=$(grep -c '192\.168\.1\.1' "$CFG_GEN" 2>/dev/null || true)
+  sed -i 's/192\.168\.1\.1/192.168.123.1/g' "$CFG_GEN"
+  after=$(grep -c '192\.168\.123\.1' "$CFG_GEN" 2>/dev/null || true)
+  echo ">>> OK: config_generate LAN IP patched (found $before occurrence(s), now $after)"
+else
+  echo ">>> WARNING: $CFG_GEN not found; relying on 99-custom uci-defaults for LAN IP" >&2
+fi
+
+# 【自检】确认新管理地址确实写进了固件（image config + 编译期兜底 + 首启脚本三保险）
+if grep -q '^CONFIG_TARGET_PREINIT_IP="192.168.123.1"$' .config 2>/dev/null && \
+   grep -q '^CONFIG_TARGET_DEFAULT_LAN_IP_FROM_PREINIT=y$' .config 2>/dev/null && \
+   grep -q '192\.168\.123\.1' "$CFG_GEN" 2>/dev/null && \
+   grep -q "network.lan.ipaddr='192.168.123.1/24'" files/etc/uci-defaults/99-custom 2>/dev/null && \
+   grep -q '192.168.123.0/24' files/etc/uci-defaults/99-custom 2>/dev/null; then
+  echo ">>> OK: firmware LAN IP = 192.168.123.1 and scan subnet = 192.168.123.0/24"
+else
+  echo ">>> FATAL: LAN IP patch incomplete; firmware would boot at old address." >&2
+  echo ">>> DIAG: .config LAN lines:" >&2
+  grep -n 'PREINIT_IP\|DEFAULT_LAN_IP_FROM_PREINIT' .config 2>/dev/null | head -10 >&2 || true
+  echo ">>> DIAG: config_generate IP lines:" >&2
+  grep -n '192.168' "$CFG_GEN" 2>/dev/null | head -10 >&2 || true
+  exit 1
+fi
