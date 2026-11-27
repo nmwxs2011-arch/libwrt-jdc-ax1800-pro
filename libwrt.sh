@@ -187,3 +187,23 @@ if grep -q '^# CONFIG_FEED_passwall2 is not set' .config 2>/dev/null; then
   exit 1
 fi
 echo ">>> OK: CONFIG_FEED_passwall2=y in .config"
+
+# 【自检 v5.3】确认语言开关与 PassWall2 依赖齐全，避免再次产出缺包固件。
+# 语言：LuCI 翻译包 HIDDEN，真正开关是 LUCI_LANG_*；vi=y 会导致 zh-cn 包不生成。
+if grep -q '^CONFIG_LUCI_LANG_vi=y' .config 2>/dev/null; then
+  echo ">>> FATAL: CONFIG_LUCI_LANG_vi=y still set; Chinese (zh-cn) packages will NOT be built." >&2
+  exit 1
+fi
+grep -q '^CONFIG_LUCI_LANG_zh_Hans=y' .config 2>/dev/null || {
+  echo ">>> FATAL: CONFIG_LUCI_LANG_zh_Hans not set; Chinese (zh-cn) packages will NOT be built." >&2
+  exit 1
+}
+echo ">>> OK: CONFIG_LUCI_LANG_zh_Hans=y in .config"
+# PassWall2 的 7 个显式依赖：缺任意一个，defconfig 都会丢弃 luci-app-passwall2。
+for dep in coreutils coreutils-base64 coreutils-nohup coreutils-timeout ip-full libuci-lua unzip; do
+  grep -q "^CONFIG_PACKAGE_${dep}=y" .config 2>/dev/null || {
+    echo ">>> FATAL: CONFIG_PACKAGE_${dep} not set; luci-app-passwall2 will be dropped." >&2
+    exit 1
+  }
+done
+echo ">>> OK: all 7 PassWall2 deps enabled in .config"
