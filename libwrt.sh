@@ -127,12 +127,26 @@ chmod +x files/etc/uci-defaults/99-custom
 # 若缺失就直接 fail，让编译停在这里，而不是浪费 1.5 小时后才发现缺包。
 check_pkg() {
   local name="$1"
-  if ! find package/feeds -maxdepth 3 -name "$name" 2>/dev/null | grep -q .; then
-    echo ">>> FATAL: package '$name' not installed by feeds; defconfig will drop it." >&2
-    return 1
+  # feeds install 按「源目录名」建软链；一个 Makefile 常产出多个子包，
+  # 例如 sane-backends 产出 libsane / sane-daemon / sane-epson2 / sane-frontends，
+  # 磁盘上并没有叫 sane-daemon 的目录。所以先找同名目录（如 luci-app-passwall2），
+  # 再回退到 feed 源码里的 "define Package/<name>"，并确认其源包已被 install。
+  if find package/feeds -maxdepth 2 -name "$name" 2>/dev/null | grep -q .; then
+    echo ">>> OK: package '$name' visible to defconfig (source dir)"
+    return 0
   fi
-  echo ">>> OK: package '$name' visible to defconfig"
+  local mk src feed
+  mk=$(grep -rl --include=Makefile "define Package/$name" feeds 2>/dev/null | head -n1)
+  if [ -n "$mk" ]; then
+    src=$(basename "$(dirname "$mk")")
+    feed=$(echo "$mk" | cut -d/ -f2)
+    if [ -e "package/feeds/$feed/$src" ]; then
+      echo ">>> OK: package '$name' visible to defconfig (in $feed/$src)"
+      return 0
+    fi
+  fi
+  echo ">>> FATAL: package '$name' not installed by feeds; defconfig will drop it." >&2
+  return 1
 }
 check_pkg luci-app-passwall2 || exit 1
 check_pkg sane-daemon || exit 1
-
